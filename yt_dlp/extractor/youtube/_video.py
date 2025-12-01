@@ -2628,18 +2628,29 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
     def _get_checkok_params():
         return {'contentCheckOk': True, 'racyCheckOk': True}
 
-    @classmethod
-    def _generate_player_context(cls, sts=None):
+    def _generate_player_context(self, sts=None):
         context = {
             'html5Preference': 'HTML5_PREF_WANTS',
         }
         if sts is not None:
             context['signatureTimestamp'] = sts
+
+        playback_context = {
+            'contentPlaybackContext': context,
+        }
+
+        # The 'adPlaybackContext'/'request_no_ads' workaround results in a loss of premium formats.
+        # Only default to 'true' if the user is unauthenticated, since we can't reliably detect all
+        # types of premium accounts (e.g. YTMusic Premium), and since premium users don't have ads.
+        default_arg_value = 'false' if self.is_authenticated else 'true'
+        if self._configuration_arg('request_no_ads', [default_arg_value])[0] != 'false':
+            playback_context['adPlaybackContext'] = {
+                'pyv': True,
+            }
+
         return {
-            'playbackContext': {
-                'contentPlaybackContext': context,
-            },
-            **cls._get_checkok_params(),
+            'playbackContext': playback_context,
+            **self._get_checkok_params(),
         }
 
     def _get_config_po_token(self, client: str, context: _PoTokenContext):
@@ -4029,6 +4040,11 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                     STREAMING_DATA_CLIENT_NAME: client_name,
                 })
 
+        def set_audio_lang_from_orig_subs_lang(lang_code):
+            for f in formats:
+                if f.get('acodec') != 'none' and not f.get('language'):
+                    f['language'] = lang_code
+
         subtitles = {}
         skipped_subs_clients = set()
 
@@ -4088,7 +4104,8 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
 
                 orig_lang = qs.get('lang', [None])[-1]
                 lang_name = self._get_text(caption_track, 'name', max_runs=1)
-                if caption_track.get('kind') != 'asr':
+                is_manual_subs = caption_track.get('kind') != 'asr'
+                if is_manual_subs:
                     if not lang_code:
                         continue
                     process_language(
@@ -4099,16 +4116,14 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                     if not trans_code:
                         continue
                     orig_trans_code = trans_code
-                    if caption_track.get('kind') != 'asr' and trans_code != 'und':
+                    if is_manual_subs and trans_code != 'und':
                         if not get_translated_subs:
                             continue
                         trans_code += f'-{lang_code}'
                         trans_name += format_field(lang_name, None, ' from %s')
                     if lang_code == f'a-{orig_trans_code}':
                         # Set audio language based on original subtitles
-                        for f in formats:
-                            if f.get('acodec') != 'none' and not f.get('language'):
-                                f['language'] = orig_trans_code
+                        set_audio_lang_from_orig_subs_lang(orig_trans_code)
                         # Add an "-orig" label to the original language so that it can be distinguished.
                         # The subs are returned without "-orig" as well for compatibility
                         process_language(
@@ -4118,6 +4133,21 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                     process_language(
                         automatic_captions, base_url, trans_code, trans_name, client_name,
                         pot_params if orig_lang == orig_trans_code else {'tlang': trans_code, **pot_params})
+
+                # Extract automatic captions when the language is not in 'translationLanguages'
+                # e.g. Cantonese [yue], see https://github.com/yt-dlp/yt-dlp/issues/14889
+                lang_code = remove_start(lang_code, 'a-')
+                if is_manual_subs or not lang_code or lang_code in automatic_captions:
+                    continue
+                lang_name = remove_end(lang_name, ' (auto-generated)')
+                if caption_track.get('isTranslatable'):
+                    # We can assume this is the original audio language
+                    set_audio_lang_from_orig_subs_lang(lang_code)
+                    process_language(
+                        automatic_captions, base_url, f'{lang_code}-orig',
+                        f'{lang_name} (Original)', client_name, pot_params)
+                process_language(
+                    automatic_captions, base_url, lang_code, lang_name, client_name, pot_params)
 
             # Avoid duplication if we've already got everything we need
             need_subs_langs.difference_update(subtitles)
